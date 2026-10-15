@@ -110,3 +110,73 @@ Replace the placeholder in the remote URL with your GitHub username and reposito
 - If `uv lock` cannot connect to PyPI, check your internet connection or network restrictions, then retry. Do not hand-write `uv.lock`; it must contain a real dependency resolution.
 - If port 8000 is already in use, stop the other process or change the host-side port in `compose.yaml`.
 - If Docker cannot start, make sure Docker Desktop/Engine is running before retrying `docker compose up --build`.
+
+## Task 02 — Simple Messages API
+
+### Overview
+
+A versioned FastAPI REST API for creating, listing, retrieving, updating, and deleting messages. Messages are stored in an in-memory Python dictionary.
+
+### Endpoints
+
+| Method | Endpoint | Success status |
+|---|---|---|
+| POST | `/api/v1/messages` | 201 Created |
+| GET | `/api/v1/messages` | 200 OK |
+| GET | `/api/v1/messages/{message_id}` | 200 OK |
+| PATCH | `/api/v1/messages/{message_id}` | 200 OK |
+| DELETE | `/api/v1/messages/{message_id}` | 204 No Content |
+
+### Example requests
+
+Create a message:
+
+```json
+{
+  "role": "user",
+  "content": "What is FastAPI?"
+}
+```
+
+Update a message:
+
+```json
+{
+  "content": "Explain FastAPI in simple words."
+}
+```
+
+List messages with pagination and filtering:
+
+`GET /api/v1/messages?limit=10&offset=0&role=user`
+
+### Validation and errors
+
+- Roles must be `user` or `assistant`.
+- Content must contain 1–2,000 characters after trimming whitespace.
+- `limit` must be between 1 and 100; `offset` must be zero or greater.
+- HTTP 201 indicates successful creation.
+- HTTP 200 indicates a successful read or update.
+- HTTP 204 indicates successful deletion with no response body.
+- HTTP 404 indicates the requested message does not exist.
+- HTTP 422 indicates invalid request data or query parameters.
+
+### Testing
+
+Run automated tests:
+
+```bash
+uv run pytest -v
+```
+
+Run the application:
+
+```bash
+uv run uvicorn project_api.main:app --reload
+```
+
+Open Swagger UI at `http://127.0.0.1:8000/docs`.
+
+### Scope
+
+No database, authentication, or LLM was added. Message data is stored in memory and resets when the application restarts.
