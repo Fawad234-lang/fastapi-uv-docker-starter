@@ -1,55 +1,82 @@
+"""Chat tests use dependency overrides; they never call a live provider."""
+
+from uuid import UUID
+
 import pytest
 from fastapi.testclient import TestClient
 
-from project_api import chat as chat_api
-from project_api import main as api
-from project_api.llm_service import (
+from project_api.api.dependencies import get_llm_service
+from project_api.core.exceptions import (
     LLMAuthenticationError,
     LLMConfigurationError,
     LLMRateLimitError,
-    LLMRequestTimeoutError,
-    LLMResult,
+    LLMTimeoutError,
     LLMUnavailableError,
 )
+from project_api.main import create_app
+from project_api.services.llm import LLMResult
+
+
+class FakeLLMService:
+    def __init__(self, result=None, error=None):
+        self.result = result or LLMResult(
+            answer="Separation of concerns keeps each part focused on one responsibility.",
+            model="test-model",
+            input_tokens=10,
+            output_tokens=42,
+        )
+        self.error = error
+        self.last_message = None
+
+    async def generate_reply(self, message: str) -> LLMResult:
+        self.last_message = message
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 @pytest.fixture
-def client():
-    with TestClient(api.app) as test_client:
+def app():
+    application = create_app()
+    # Default fake keeps tests independent of local credentials and network.
+    application.dependency_overrides[get_llm_service] = lambda: FakeLLMService()
+    yield application
+    application.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(app):
+    with TestClient(app) as test_client:
         yield test_client
 
 
-def test_chat_success_uses_fake_llm(monkeypatch, client):
-    called = {}
+def use_fake(app, service):
+    app.dependency_overrides[get_llm_service] = lambda: service
 
-    async def fake_generate_reply(message):
-        called["message"] = message
-        return LLMResult(
-            answer="Dependency injection supplies a dependency from outside a function.",
-            model="test-model",
-            input_tokens=12,
-            output_tokens=18,
-        )
 
-    monkeypatch.setattr(chat_api, "generate_reply", fake_generate_reply)
+def test_chat_success_uses_injected_fake_service(app, client):
+    fake = FakeLLMService()
+    use_fake(app, fake)
     response = client.post(
         "/api/v1/chat",
-        json={"message": "  Explain dependency injection.  "},
+        json={"message": "  Why is separation of concerns useful?  "},
+        headers={"X-Request-ID": "task04-test-123"},
     )
-
     assert response.status_code == 200
-    assert called["message"] == "Explain dependency injection."
+    assert fake.last_message == "Why is separation of concerns useful?"
     assert response.json() == {
-        "answer": "Dependency injection supplies a dependency from outside a function.",
+        "answer": "Separation of concerns keeps each part focused on one responsibility.",
         "model": "test-model",
-        "usage": {"input_tokens": 12, "output_tokens": 18},
+        "usage": {"input_tokens": 10, "output_tokens": 42},
     }
+    assert response.headers["X-Request-ID"] == "task04-test-123"
 
 
 @pytest.mark.parametrize("message", ["", "   ", "\t\n"])
 def test_chat_rejects_empty_or_whitespace_message(client, message):
     response = client.post("/api/v1/chat", json={"message": message})
     assert response.status_code == 422
+    assert response.headers.get("X-Request-ID")
 
 
 def test_chat_rejects_oversized_message(client):
@@ -57,62 +84,58 @@ def test_chat_rejects_oversized_message(client):
     assert response.status_code == 422
 
 
-def test_chat_timeout_returns_safe_503(monkeypatch, client):
-    async def fake_generate_reply(_message):
-        raise LLMRequestTimeoutError("internal timeout detail must not leak")
-
-    monkeypatch.setattr(chat_api, "generate_reply", fake_generate_reply)
-    response = client.post("/api/v1/chat", json={"message": "Hello"})
-
+def test_timeout_maps_to_safe_503_and_matching_request_id(app, client):
+    use_fake(app, FakeLLMService(error=LLMTimeoutError("PRIVATE TIMEOUT DETAIL")))
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "Hello"},
+        headers={"X-Request-ID": "timeout-case-42"},
+    )
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "llm_timeout"
-    assert "internal timeout detail" not in response.text
+    assert response.json()["error"]["code"] == "llm_timeout"
+    assert response.json()["error"]["request_id"] == "timeout-case-42"
+    assert response.headers["X-Request-ID"] == "timeout-case-42"
+    assert "PRIVATE TIMEOUT DETAIL" not in response.text
 
 
-def test_chat_provider_auth_failure_is_safe(monkeypatch, client):
-    async def fake_generate_reply(_message):
-        raise LLMAuthenticationError("API KEY SECRET MUST NOT LEAK")
-
-    monkeypatch.setattr(chat_api, "generate_reply", fake_generate_reply)
+def test_rate_limit_maps_to_safe_429(app, client):
+    use_fake(app, FakeLLMService(error=LLMRateLimitError("PRIVATE QUOTA DETAIL")))
     response = client.post("/api/v1/chat", json={"message": "Hello"})
-
-    assert response.status_code == 502
-    assert response.json()["detail"]["code"] == "llm_authentication_failed"
-    assert "SECRET" not in response.text
-
-
-def test_chat_rate_limit_returns_429(monkeypatch, client):
-    async def fake_generate_reply(_message):
-        raise LLMRateLimitError("provider detail must not leak")
-
-    monkeypatch.setattr(chat_api, "generate_reply", fake_generate_reply)
-    response = client.post("/api/v1/chat", json={"message": "Hello"})
-
     assert response.status_code == 429
-    assert response.json()["detail"]["code"] == "llm_rate_limited"
-    assert "provider detail" not in response.text
+    assert response.json()["error"]["code"] == "llm_rate_limited"
+    assert response.json()["error"]["request_id"] == response.headers["X-Request-ID"]
+    assert "PRIVATE QUOTA DETAIL" not in response.text
 
 
-def test_chat_missing_configuration_returns_safe_503(monkeypatch, client):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    # This test deliberately exercises configuration validation, not the network.
+@pytest.mark.parametrize(
+    ("error", "status_code", "code", "secret"),
+    [
+        (LLMAuthenticationError("GEMINI KEY SECRET"), 502, "llm_authentication_failed", "GEMINI KEY SECRET"),
+        (LLMConfigurationError("CONFIG SECRET"), 503, "llm_not_configured", "CONFIG SECRET"),
+        (LLMUnavailableError("PRIVATE RESPONSE BODY"), 503, "llm_unavailable", "PRIVATE RESPONSE BODY"),
+    ],
+)
+def test_provider_auth_configuration_and_outage_are_safe(app, client, error, status_code, code, secret):
+    use_fake(app, FakeLLMService(error=error))
     response = client.post("/api/v1/chat", json={"message": "Hello"})
+    assert response.status_code == status_code
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["request_id"] == response.headers["X-Request-ID"]
+    assert secret not in response.text
 
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "llm_not_configured"
+
+def test_request_without_id_gets_generated_id(client):
+    response = client.get("/health")
+    request_id = response.headers.get("X-Request-ID")
+    assert request_id
+    UUID(request_id)
 
 
-def test_chat_provider_outage_returns_safe_503(monkeypatch, client):
-    async def fake_generate_reply(_message):
-        raise LLMUnavailableError("private provider response must not leak")
-
-    monkeypatch.setattr(chat_api, "generate_reply", fake_generate_reply)
-    response = client.post("/api/v1/chat", json={"message": "Hello"})
-
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "llm_unavailable"
-    assert "private provider response" not in response.text
+def test_unsafe_request_id_is_replaced(client):
+    response = client.get("/health", headers={"X-Request-ID": "bad\r\nheader"})
+    request_id = response.headers["X-Request-ID"]
+    assert request_id != "bad\r\nheader"
+    UUID(request_id)
 
 
 def test_health_endpoint_still_works(client):
@@ -124,6 +147,6 @@ def test_health_endpoint_still_works(client):
 def test_messages_endpoint_still_works(client):
     response = client.post(
         "/api/v1/messages",
-        json={"role": "user", "content": "Task 03 must preserve Task 02."},
+        json={"role": "user", "content": "Task 04 preserves Task 02."},
     )
     assert response.status_code == 201
