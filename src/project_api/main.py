@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response
 
 from project_api import __version__
+from project_api.chat import router as chat_router
 from project_api.models import (
     MessageCreate,
     MessageResponse,
@@ -171,3 +172,7 @@ def delete_message(message_id: int) -> Response:
     get_message_or_raise(message_id)
     del messages[message_id]
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# Task 03: one-turn LLM chat endpoint.
+app.include_router(chat_router)
