@@ -1,3 +1,4 @@
+"""Pydantic models retained from Task 02."""
 
 from datetime import datetime, timezone
 from typing import Literal
